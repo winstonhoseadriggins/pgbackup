@@ -1,0 +1,644 @@
+#!/bin/bash
+
+INSTALLDIR=/usr/local/pgbackup
+CONFIG=${INSTALLDIR}/pgbackup.cfg
+ARCHIVE=0
+TODAY=$(date +%Y%m%d)
+
+declare -A BACKUPS
+
+usage() {
+    echo "Usage: $(basename $0) <action>"
+    echo -e "valid actions:"
+    echo -e "\tbackup   -- backup and prune database data and WALs"
+    echo -e "\tarchive  -- backup and move to archive"
+    echo -e "\tlist     -- list available backups"
+    echo -e "\trecover [time] -- point in time recovery; prompts for time if not specified"
+}
+
+log() {
+    echo -e "$(date -u) ${HOSTNAME%%.*}: $@"
+}
+
+ddlog() {
+    # format:
+    # _e{title.length,text.length}:title|text|d:date_happened|h:hostname|k:aggregationkey|p:priority|t:alert_type|#tag1,tag2
+    # echo "_e{${#title},${#text}}:$title|$text|#shell,bash"  >/dev/udp/localhost/8125
+    _TITLE="$1 (${HOSTNAME%%.*})"
+    _TEXT="$(date -u): $2"
+    _PRIO=$3
+    _TYPE=$4
+    _AGGREGATIONKEY="pgbackup-${HOSTNAME%%.*}"
+    _TAGS='pgbackup'
+    _DOGSTATSD=/dev/udp/localhost4/8125
+
+
+    echo "_e{${#_TITLE},${#_TEXT}}:${_TITLE}|${_TEXT}|p:${_PRIO}|t:${_TYPE}|k:${_AGGREGATIONKEY}|#${_TAGS}" > ${_DOGSTATSD}
+}
+
+ddlog_error() {
+    _TEXT=$1
+
+    ddlog "PGBACKUP ERROR" "${_TEXT}" "normal" "error"
+}
+
+ddlog_warn() {
+    _TEXT=$1
+
+    ddlog "PGBACKUP WARNING" "${_TEXT}" "normal" "warning"
+}
+
+ddlog_info() {
+    _TEXT=$1
+
+    ddlog "PGBACKUP INFO" "${_TEXT}" "normal" "info"
+}
+
+ddlog_success() {
+    _TEXT=$1
+
+    ddlog "PGBACKUP SUCCESS" "${_TEXT}" "normal" "success"
+}
+
+init() {
+    if [ ! -e "${CONFIG}" ]; then
+        ddlog_error "Configuration file ${CONFIG} not found."
+        log "Configuration file ${CONFIG} not found."
+        exit 1
+    else
+        . ${CONFIG}
+    fi
+}
+
+get_vgfree() {
+    _FREE=$(vgs -o vg_free --noheadings --nosuffix --units g ${PGVG})
+    echo ${_FREE%%.*}
+}
+
+backup_sanity_check() {
+    _ERROR=""
+
+    mount | grep -qw ${BACKUP_MOUNT}
+    if [ "$?" -ne 0 ]; then
+        _ERROR="${_ERROR}Backup mount point ${BACKUP_MOUNT} is not mounted.\n"
+    fi
+
+    _BACKUP_DIR="${PGDATA_DAILY_BACKUP_DIR}"
+    [ -d "${_BACKUP_DIR}" ] || mkdir -p ${_BACKUP_DIR}
+    if [ "$?" -ne 0 ]; then
+        _ERROR="${_ERROR}Could not create backup destination ${_BACKUP_DIR}.\n"
+    fi
+
+    touch ${_BACKUP_DIR}/testfile-${TODAY}
+    if [ "$?" -ne 0 ]; then
+        _ERROR="${_ERROR}Could not write to backup destination ${_BACKUP_DIR}.\n"
+    else
+        \rm ${_BACKUP_DIR}/testfile-${TODAY} &> /dev/null
+    fi
+
+    _BACKUP_DIR="${PGDATA_BACKUP_ARCHIVE_DIR}"
+    [ -d "${_BACKUP_DIR}" ] || mkdir -p ${_BACKUP_DIR}
+    if [ "$?" -ne 0 ]; then
+        _ERROR="${_ERROR}Could not create backup destination ${_BACKUP_DIR}.\n"
+    fi
+
+    touch ${_BACKUP_DIR}/testfile-${TODAY}
+    if [ "$?" -ne 0 ]; then
+        _ERROR="${_ERROR}Could not write to backup destination ${_BACKUP_DIR}.\n"
+    else
+        \rm ${_BACKUP_DIR}/testfile-${TODAY} &> /dev/null
+    fi
+
+    _FREE=$(get_vgfree)
+    if [ "${_FREE}" -le "${SNAP_SIZE}" ]; then
+        _ERROR="${_ERROR}Not enough VG space for ${SNAP_SIZE}G pgdata snapshot.\n"
+    fi
+
+    if [ "${#_ERROR}" -gt 0 ]; then
+        ddlog_error "${_ERROR}"
+        log "${_ERROR}"
+        exit 1
+    fi
+}
+
+backup_command() {
+    _SRC=$1
+    _DST=$2
+
+    if [ -z "${_SRC}" -o -z "${_DST}" ]; then
+        echo "Source or destination not specified."
+        return 1
+    else
+        rsync -a --delete-after ${_SRC} ${_DST}
+        return $?
+    fi
+}
+
+archive_command() {
+    _SRC=$1
+    _DST=$2
+
+    if [ -z "${_SRC}" -o -z "${_DST}" ]; then
+        echo "Source or destination not specified."
+        return 1
+    else
+        rsync -a --delete-after ${_SRC} ${_DST}
+        return $?
+    fi
+}
+
+snapshot() {
+    _NAME=$1
+    _TARGET=$2
+    _FREE=$(get_vgfree)
+
+    [ -z "${_NAME}" ] && return 1
+    [ -z "${_TARGET}" ] && return 1
+
+    if [ "${_FREE}" -le "${SNAP_SIZE}" ]; then
+        ddlog_error "Not enough VG space for ${SNAP_SIZE}G pgdata snapshot."
+        log "Not enough VG space for ${SNAP_SIZE}G pgdata snapshot."
+        return 1
+    fi
+
+    _RESULT=$(lvcreate -s -n ${_NAME} -L ${SNAP_SIZE}G ${_TARGET} 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        ddlog_error "${_RESULT}."
+        log "${_RESULT}."
+        return 1
+    fi
+
+    return 0
+}
+
+lock_error() {
+    ddlog_error "Could not get a lock. Another backup process is happening."
+    log "Could not get a lock. Another backup process is happening."
+    exit 1
+}
+
+prune_pgdata_backup() {
+    _REMOVE=$(($(ls ${PGDATA_BACKUP_ARCHIVE_DIR} | wc -l) - ${WEEKS_TO_KEEP}))
+    _KILL_LIST=$(ls ${PGDATA_BACKUP_ARCHIVE_DIR} | head -${_REMOVE})
+
+    ddlog_info "Commencing removal of old pgdata backups."
+    log "Commencing removal of old pgdata backups."
+
+    _TIMECHECK=$(date +%s -u -d ${TODAY})
+    _START=$(date +%s)
+    for _BACKUP in ${_KILL_LIST}; do
+        _TIMESTAMP=$(date +%s -u -d "${_BACKUP}")
+        _DIFF=$(( (${_TIMECHECK}-${_TIMESTAMP}) / 604800 ))
+        [ "${_DIFF}" -lt "${WEEKS_TO_KEEP}" ] && continue
+
+        _RESULT=$(\rm -rf ${PGDATA_BACKUP_ARCHIVE_DIR}/${_BACKUP} 2>&1 )
+        if [ "$?" -ne 0 ]; then
+            ddlog_error "Could not remove ${PGDATA_BACKUP_ARCHIVE_DIR}/${_BACKUP} from the archive.\n${_RESULT}"
+            log "Could not remove ${PGDATA_BACKUP_ARCHIVE_DIR}/${_BACKUP} from the archive.\n${_RESULT}"
+        else
+            ddlog_success "Old backup ${_BACKUP} has been deleted."
+            log "Old backup ${_BACKUP} has been deleted."
+        fi
+    done
+
+    ddlog_info "Removal of old pgdata backups took $(($(date +%s) - ${_START})) seconds."
+    log "Removal of old pgdata backups took $(($(date +%s) - ${_START})) seconds."
+}
+
+prune_pgxlog() {
+    ddlog_info "Commencing removal of old WAL files."
+    log "Commencing removal of old WAL files."
+
+    _START=$(date +%s)
+
+    _RESULT=$(find ${PGARCHIVE} -type f -mtime +${XLOG_DAYS_TO_KEEP} -exec rm {} \; 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        ddlog_error "Error during removal of old pgarchive files in ${PGARCHIVE}.\n${_RESULT}"
+        log "Error during removal of old pgarchive files in ${PGARCHIVE}.\n${_RESULT}"
+    fi
+
+    _RESULT=$(find ${PGXLOG_BACKUP_DIR} -type f -mtime +${DAYS_TO_KEEP} -exec rm {} \; 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        ddlog_error "Error during removal of old backup pgarchive files ${PGXLOG_BACKUP_DIR}.\n${_RESULT}"
+        log "Error during removal of old backup pgarchive files ${PGXLOG_BACKUP_DIR}.\n${_RESULT}"
+    fi
+
+    ddlog_info "Removal of old WAL files took $(($(date +%s) - ${_START})) seconds."
+    log "Removal of old WAL files took $(($(date +%s) - ${_START})) seconds"
+}
+
+pg_backup_mode() {
+    _RESULT=$(su - ${PGUSER} -c "echo \"select pg_start_backup('${BACKUP_LABEL}');\" | ${PSQL} -p ${PGPORT} -d template1" 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        ddlog_error "Could not put the database into backup mode.\n${_RESULT}"
+        log "Could not put the database into backup mode.\n${_RESULT}"
+        return 1
+    fi
+    return 0
+}
+
+pg_normal_mode() {
+    _RESULT=$(su - ${PGUSER} -c "echo \"select pg_stop_backup();\" | ${PSQL} -p ${PGPORT} -d template1" 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        ddlog_error "Could not put the database back into normal mode.\n${_RESULT}"
+        log "Could not put the database back into normal mode.\n${_RESULT}"
+        return 1
+    fi
+    return 0
+}
+
+backup() {
+    DATA_READY=0
+
+    ddlog_info "Commencing database backup."
+    log "Commencing database backup."
+
+    # clean up
+    \rm -f ${PGDATA}/data/${BACKUP_LABEL_FILE} ${PGDATA}/data/${BACKUP_LABEL_FILE_OLD} &> /dev/null
+
+    pg_backup_mode
+    [ "$?" -ne 0 ] && exit 1
+
+    if [ -e "/dev/mapper/${PGVG}-${PGDATASNAP1}" -a -e "/dev/mapper/${PGVG}-${PGDATASNAP2}" ]; then
+        umount -l /dev/mapper/${PGVG}-${PGDATASNAP2} &> /dev/null
+        _RESULT=$(lvrename ${PGVG} ${PGDATASNAP2} ${PGDATASNAPX} 2>&1)
+        if [ "$?" -ne 0 ]; then
+            ddlog_error "Could not rename LVM snapshot ${PGVG}/${PGDATASNAP2} to ${PGDATASNAPX}.\n${_RESULT}"
+            log "Could not rename LVM snapshot ${PGVG}/${PGDATASNAP2} ${PGDATASNAPX}.\n${_RESULT}"
+            ddlog_error "PGBACKUP FAILED!"
+            log "PGBACKUP FAILED!"
+            pg_normal_mode
+            exit 1
+        fi
+    fi
+
+    if [ -e "/dev/mapper/${PGVG}-${PGDATASNAP1}" ]; then
+        _RESULT=$(lvrename ${PGVG} ${PGDATASNAP1} ${PGDATASNAP2} 2>&1)
+        if [ "$?" -ne 0 ]; then
+            ddlog_error "Could not rename LVM snapshot ${PGVG}/${PGDATASNAP1} to ${PGDATASNAP2}.\n${_RESULT}"
+            log "Could not rename LVM snapshot ${PGVG}/${PGDATASNAP1} ${PGDATASNAP2}.\n${_RESULT}"
+            if [ -e "/dev/mapper/${PGVG}-${PGDATASNAPX}" ]; then
+                ddlog_info "Something went horribly wrong. The second snapshot is in /dev/mapper/${PGVG}-${PGDATASNAPX}"
+                log "Something went horribly wrong. The second snapshot is in /dev/mapper/${PGVG}-${PGDATASNAPX}"
+            fi
+            pg_normal_mode
+        fi
+    fi
+
+    if [ -e "${BACKUP_MARKER}" -a -L "${BACKUP_MARKER}" ]; then
+        ddlog_info "Active backup process found. Performing snapshot and skipping backup."
+        log "Active backup process found. Performing snapshot and skipping backup."
+
+        snapshot "${PGDATASNAP1}" "${PGVG}/${PGDATALV}"
+        if [ "$?" -eq 0 ]; then
+            if [ -e "/dev/mapper/${PGVG}-${PGDATASNAPX}" ]; then
+                _RESULT=$(lvremove -ff ${PGVG}/${PGDATASNAPX} 2>&1)
+                if [ "$?" -ne 0 ]; then
+                    ddlog_error "Could not remove temporary snapshot ${PGVG}/${PGDATASNAPX}.\n${_RESULT}"
+                    log "Could not remove temporary snapshot ${PGVG}/${PGDATASNAPX}.\n${_RESULT}"
+                fi
+            fi
+        else
+            ddlog_error "Could not create a snapshot of ${PGVG}/${PGDATALV}."
+            log "Could not create a snapshot of ${PGVG}/${PGDATALV}."
+            ddlog_error "PGBACKUP FAILED!"
+            log "PGBACKUP FAILED!"
+        fi
+
+        # check if a backup process is stuck
+        if [ -e "${BACKUP_MARKER}" ]; then
+            _SNAP=$(ls -l ${BACKUP_MARKER}|awk '{print $NF}')
+            _TIMESTAMP=$(date +%s -u -d "$(lvs --noheadings -o lv_time ${_SNAP})")
+            _NOW=$(date +%s -u)
+            _DIFF=$(($_NOW - $_TIMESTAMP))
+            _HOURS=$(($_DIFF / 3600))
+            if [ "${_HOURS}" -gt ${WARN_HOURS} ]; then
+                ddlog_warn "Backup of $_SNAP has been running for more than ${WARN_HOURS} hours."
+                log "Backup of $_SNAP has been running for more than ${WARN_HOURS} hours."
+            fi
+        fi
+    else
+        snapshot "${PGDATASNAP1}_${TODAY}" "${PGVG}/${PGDATALV}"
+        if [ "$?" -ne 0 ]; then
+            ddlog_error "Could not create a snapshot of ${PGVG}/${PGDATALV}."
+            log "Could not create a snapshot of ${PGVG}/${PGDATALV}."
+            ddlog_error "PGBACKUP FAILED!"
+            log "PGBACKUP FAILED!"
+        else
+            if [ -e "/dev/mapper/${PGVG}-${PGDATASNAPX}" ]; then
+                _RESULT=$(lvremove -ff ${PGVG}/${PGDATASNAPX} 2>&1)
+                if [ "$?" -ne 0 ]; then
+                    ddlog_error "Could not remove temporary snapshot ${PGVG}/${PGDATASNAPX}.\n${_RESULT}"
+                    log "Could not remove temporary snapshot ${PGVG}/${PGDATASNAPX}.\n${_RESULT}"
+                fi
+            fi
+            DATA_READY=1
+        fi
+    fi
+
+    pg_normal_mode
+    [ "$?" -ne 0 ] && exit 1
+
+    if [ "${DATA_READY}" -eq 0 ]; then
+        ddlog_info "End of database backup."
+        log "End of database backup."
+        exit 0
+    fi
+
+    # start the backup process
+    (
+    flock -w ${LOCKWAIT} 1001 || lock_error
+
+    _MOUNTPOINT=$(mktemp -p /mnt -d pgdatasnap-XXXX)
+    _RESULT=$(mount /dev/mapper/${PGVG}-${PGDATASNAP1}_${TODAY} ${_MOUNTPOINT} 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        ddlog_error "Could not mount /dev/mapper/${PGVG}-${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+        log "Could not mount /dev/mapper/${PGVG}-${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+        ddlog_error "PGBACKUP FAILED!"
+        log "PGBACKUP FAILED!"
+    else
+        \rm -f ${BACKUP_MARKER} &> /dev/null
+        ln -sf /dev/mapper/${PGVG}-${PGDATASNAP1}_${TODAY} ${BACKUP_MARKER}
+
+        _BACKUP_DIR="${PGDATA_DAILY_BACKUP_DIR}"
+        _START=$(date +%s)
+        _RESULT=$(backup_command ${_MOUNTPOINT}/ ${_BACKUP_DIR}/ 2>&1 )
+        if [ "$?" -ne 0 ]; then
+            ddlog_error "Backup to ${_BACKUP_DIR} failed.\n${_RESULT}"
+            log "Backup to ${_BACKUP_DIR} failed.\n${_RESULT}"
+            ddlog_error "PGBACKUP FAILED!"
+            log "PGBACKUP FAILED!"
+        else
+            _BACKUP_TIME=$(($(date +%s) - ${_START}))
+            ddlog_success "Backup to ${_BACKUP_DIR} took ${_BACKUP_TIME} seconds."
+            log "Backup to ${_BACKUP_DIR} took ${_BACKUP_TIME} seconds."
+
+            if [ "${ARCHIVE}" -eq 1 ]; then
+                _START=$(date +%s)
+                ddlog_info "Archiving ${_BACKUP_DIR} into ${PGDATA_BACKUP_ARCHIVE_DIR}/${TODAY}"
+                log "Archiving ${_BACKUP_DIR} into ${PGDATA_BACKUP_ARCHIVE_DIR}/${TODAY}"
+
+                _RESULT=$(archive_command ${_BACKUP_DIR}/ ${PGDATA_BACKUP_ARCHIVE_DIR}/${TODAY}/ 2>&1)
+                if [ "$?" -ne 0 ]; then
+                    ddlog_error "Could not archive the weekly backup.\n${_RESULT}"
+                    log "Could not archive the weekly backup.\n${_RESULT}"
+                    ddlog_error "PGBACKUP FAILED!"
+                    log "PGBACKUP FAILED!"
+                else
+                    _BACKUP_TIME=$(($(date +%s) - ${_START}))
+                    ddlog_success "Archiving took ${_BACKUP_TIME} seconds."
+                    log "Archiving took ${_BACKUP_TIME} seconds."
+
+                    # delete excess backups
+                    _COUNT=$(ls ${PGDATA_BACKUP_ARCHIVE_DIR} | wc -l)
+                    [ "${_COUNT}" -gt ${WEEKS_TO_KEEP} ] && prune_pgdata_backup
+                fi
+            fi
+        fi
+
+        umount -l ${_MOUNTPOINT}
+        \rmdir ${_MOUNTPOINT}
+
+        # rename back to pgdatasnap1 or pgdatasnap2 or delete this snapshot as necessary
+        # check first to make sure that another backup process has not created a new snapshot
+        if [ ! -e "/dev/mapper/${PGVG}-${PGDATASNAP1}" ]; then
+            _RESULT=$(lvrename ${PGVG}/${PGDATASNAP1}_${TODAY} ${PGVG}/${PGDATASNAP1} 2>&1)
+            if [ "$?" -ne 0 ]; then
+                ddlog_error "Error during lvrename. The latest LVM snapshot is ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+                log "Error during lvrename. The latest LVM snapshot is ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+            fi
+        elif [ ! -e "/dev/mapper/${PGVG}-${PGDATASNAP2}" ]; then
+            _RESULT=$(lvrename ${PGVG}/${PGDATASNAP1}_${TODAY} ${PGVG}/${PGDATASNAP2} 2>&1)
+            if [ "$?" -ne 0 ]; then
+                ddlog_error "Error during lvrename. The second snapshot is ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+                log "Error during lvrename. The second snapshot is ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+            fi
+        elif [ -e "/dev/mapper/${PGVG}-${PGDATASNAP2}" ]; then
+            _SNAPTIME=$(date +%s -u -d "$(lvs --noheadings -o lv_time ${PGVG}/${PGDATASNAP1}_${TODAY})")
+            _SNAP2TIME=$(date +%s -u -d "$(lvs --noheadings -o lv_time ${PGVG}/${PGDATASNAP2})")
+            _DIFF=$((${_SNAPTIME}-${_SNAP2TIME}))
+            if [ "${_DIFF}" -gt 0 ]; then
+                _RESULT=$(lvremove -ff ${PGVG}/${PGDATASNAP2} 2>&1)
+                if [ "$?" -eq 0 ]; then
+                    _RESULT=$(lvrename ${PGVG}/${PGDATASNAP1}_${TODAY} ${PGVG}/${PGDATASNAP2} 2>&1)
+                    if [ "$?" -ne 0 ]; then
+                        ddlog_error "Error during lvrename. The second snapshot is ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+                        log "Error during lvrename. The second snapshot is ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+                    fi
+                else
+                    ddlog_error "Could not remove snapshot ${PGVG}/${PGDATASNAP2}.\n${_RESULT}"
+                    log "Could not remove snapshot ${PGVG}/${PGDATASNAP2}.\n${_RESULT}"
+                fi
+            else
+                _RESULT=$(lvremove -ff ${PGVG}/${PGDATASNAP1}_${TODAY} 2>&1)
+                if [ "$?" -ne 0 ]; then
+                    ddlog_error "Could not remove LVM snapshot ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+                    log "Could not remove LVM snapshot ${PGDATASNAP1}_${TODAY}.\n${_RESULT}"
+                fi
+            fi
+        fi
+    fi
+
+    prune_pgxlog
+
+    \rm -f ${BACKUP_MARKER} &> /dev/null
+
+    ddlog_info "End of database backup."
+    log "End of database backup."
+
+    ) 1001> ${LOCK}
+}
+
+get_backup_catalog() {
+    BACKUPS=()
+    i=1
+    for _SNAP in ${PGDATASNAP1} ${PGDATASNAP2}; do
+        [ ! -e /dev/mapper/${PGVG}-${_SNAP} ] && continue
+        _SNAPTIME=$(date +'%F %H:%M:%S' -u -d "$(lvs --noheadings -o lv_time ${PGVG}/${_SNAP})")
+        BACKUPS["$i"]="Snapshot ${_SNAPTIME}"
+        i=$(($i + 1))
+    done
+
+    for _BACKUP in $(ls ${PGDATA_BACKUP_ARCHIVE_DIR}); do
+        BACKUPS["$i"]="Archive $(date +'%F' -d ${_BACKUP})"
+        i=$(($i + 1))
+    done
+}
+
+list() {
+    get_backup_catalog
+    i=1
+    while [ "$i" -le "${#BACKUPS[@]}" ]; do
+        echo "$i)  ${BACKUPS[$i]}"
+        i=$(($i + 1))
+    done
+}
+
+kill_postgres() {
+    # stop the db service first
+    log "Attempting to stop all ${PGPROCESS} processes..."
+    _RESULT=$(${PGSERVICE} stop 2>&1 )
+    if [ "$?" -ne 0 ]; then
+        log "Could not stop the database service. Will try to brute force kill the database processes."
+        pkill ${PGPROCESS}
+        sleep 10
+        pidof ${PGPROCESS}
+        if [ "$?" -eq 0 ]; then
+            log "Database service could not be killed gracefully. Will attempt kill -9"
+            pkill -9 ${PGPROCESS}
+            sleep 10
+            pidof ${PGPROCESS}
+            if [ "$?" -eq 0 ]; then
+                log "The database service refuses to die. Kill it yourself and rerun the restore procedure."
+                return 1
+            fi
+        fi
+    fi
+    sleep 10
+    log "All ${PGPROCESS} processes have been stopped."
+    return 0
+}
+
+recover() {
+    _TIME="$1"
+    _RESTORESNAP=""
+    _ACTIVESNAP=""
+
+    if [ -z "${_TIME}" ]; then
+        read -p "Specify time in ${TIMEZONE} for PITR (YYYY-MM-DD hh:mm:ss): " _TIME
+        if [ -z "${_TIME}" ]; then
+            log "No time specified."
+            exit 1
+        fi
+    fi
+
+    # check if _TIME is even valid
+    date -d "${_TIME}" &> /dev/null
+    if [ "$?" -ne 0 ]; then
+        log "Invalid time specification ${_TIME}"
+        exit 1
+    fi
+
+    if [ -e "${BACKUP_MARKER}" -a -L "${BACKUP_MARKER}" ]; then
+        log "There is an active backup process. Restoring will require stopping this process."
+        read -p "Continue? (Y/N) " _CONTINUE
+        if [ "${_CONTINUE}" != "y" -o "${_CONTINUE}" != "Y" ]; then
+            exit 0
+        else
+            _ACTIVESNAP=$(ls -l ${BACKUP_MARKER}|awk '{print $NF}')
+        fi
+    fi
+
+    if [ ! -z "${_ACTIVESNAP}" ]; then
+        log "Attempting to kill active backup process..."
+
+        # start killing active backup processes
+        fuser -km ${_ACTIVESNAP}
+        sleep 5
+
+        # wait and force kill if needed
+        fuser -m ${_ACTIVESNAP} && fuser -k -9 -m ${_ACTIVESNAP}
+        sleep 10
+
+        if fuser -m ${_ACTIVESNAP}; then
+            log "Could not kill the active backup process that is using ${_ACTIVESNAP}. Kill it yourself."
+            exit 1
+        fi
+
+        _ACTIVESNAP=$(basename ${_ACTIVESNAP})
+        _ACTIVESNAP=${_ACTIVESNAP##*-}
+    fi
+
+    log "Looking for an appropriate restore point..."
+    _RESTORETIME=$(date +%s -u -d "${_TIME}")
+    for _SNAP in ${PGDATASNAP1} ${PGDATASNAP2} ${_ACTIVESNAP}; do
+        [ ! -e /dev/mapper/${PGVG}-${_SNAP} ] && continue
+        _SNAPTIME=$(date +%s -u -d "$(lvs --noheadings -o lv_time ${PGVG}/${_SNAP})")
+        _DIFF=$((${_RESTORETIME} - ${_SNAPTIME}))
+        if [ "${_DIFF}" -gt 0 ]; then
+            _RESTORESNAP=${_SNAP}
+            break
+        fi
+    done
+
+    if [ -z "${_RESTORESNAP}" ]; then
+        log "Could not find an appropriate LVM restore point."
+        exit 1
+    fi
+
+    log "Attempting to stop the database service..."
+    kill_postgres || exit 1
+
+    log "Unmounting ${PGXLOG} and ${PGDATA}"
+    umount ${PGXLOG}
+    umount ${PGDATA}
+    if [ "$?" -ne 0 ]; then
+        log "Could not unmount {PGDATA}"
+        exit 1
+    fi
+
+    log "Attempting to merge ${_RESTORESNAP}..."
+    mount|grep -q "/dev/mapper/${PGVG}-${_RESTORESNAP}" && umount /dev/mapper/${PGVG}-${_RESTORESNAP}
+    lvconvert --merge ${PGVG}/${_RESTORESNAP}
+    if [ "$?" -ne 0 ]; then
+        log "Could not merge ${_RESTORESNAP} to ${PGVG}/${PGDATALV}"
+        exit 1
+    fi
+
+    log "Remounting ${PGDATA} and ${PGXLOG}"
+    mount ${PGDATA} && mount ${PGXLOG}
+    if [ "$?" -ne 0 ]; then
+        log "Error mounting database volumes. ${PGDATA} and ${PGXLOG}"
+        exit 1
+    fi
+
+    # clean up
+    \rm -f ${PGDATA}/data/${BACKUP_LABEL_OLD} &> /dev/null
+    \rm -f ${PGDATA}/data/recovery.{conf,done} &> /dev/null
+    \rm -f ${PGDATA}/data/postmaster.{opts,pid} &> /dev/null
+    _TEMPXLOG=$(mktemp -d -t pgbackup-tmp-XXXX -p ${PGXLOG})
+    \mv ${PGXLOG}/* ${_TEMPXLOG} &> /dev/null
+    log "WAL files have been moved to the temporary directory ${_TEMPXLOG}."
+
+    # shut off any connection to postgres
+    log "Blocking incoming port ${PGPORT} connections..."
+    /sbin/iptables-save > ${FIREWALL_SAVE_FILE}
+    /sbin/iptables -I INPUT -p tcp --dport ${PGPORT} -j DROP
+    log "Blocked all connections to port ${PGPORT}. You may re-open the port at any time by executing '${RECOVERY_END_SCRIPT}'"
+
+    # generate recovery.conf
+    log "Generating recovery.conf file"
+    cat <<EOF > ${RECOVERY_CONF}
+restore_command = '/bin/cp ${RECOVERY_SOURCE}/%f %p.temp; /bin/mv %p.temp %p'
+recovery_target_time = '${_TIME} ${TIMEZONE}'
+EOF
+    chown ${PGUSER}:${PGGROUP} ${RECOVERY_CONF}
+
+    log "Recovery file is ready. Verify ${RECOVERY_CONF} and start database service by running '${PGSERVICE} start'"
+}
+
+init
+
+case "$1" in
+    backup)
+        backup_sanity_check
+        backup
+        ;;
+    archive)
+        ARCHIVE=1
+        backup_sanity_check
+        backup
+        ;;
+    list)
+        list
+        ;;
+    recover)
+        recover "$2"
+        [ "${AUTOSTART}" == "true" ] && ${PGSERVICE} start
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
+
